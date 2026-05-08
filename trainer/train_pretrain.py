@@ -35,16 +35,17 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
-
+        #将loss放大后再反向传播，防止fp16下梯度下溢
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
+            #step是让优化器更新参数，同时更新优化器内部状态
             scaler.step(optimizer)
+            #动态调整scale值，如果scale太大，loss会出现上溢，scale太小会发生下溢
             scaler.update()
-
+            #把梯度全部设置为None，不用保留全0梯度的tensor，可以节省内存和加速下一次反向传播
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters:
@@ -64,13 +65,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
+            #转成fp16，减小文件大小，转到cpu，避免保存gpu tensor
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
             del state_dict
 
         del input_ids, labels, res, loss
-
+    #处理还没更新的梯度
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -118,6 +120,7 @@ if __name__ == "__main__":
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    #根据设备自动选择是否转半精度。cuda自动混精度加速
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
     # ========== 4. 配wandb ==========
@@ -127,12 +130,17 @@ if __name__ == "__main__":
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        #project是实验的项目名称，id是指定或恢复一个实验运行的唯一标识符，resume是当提供的id存在时是否继续运行（'must'表示必须继续，None表示不继续）。如果提供了wandb_id并且resume设置为'must'，则会尝试恢复之前的运行，否则会创建一个新的运行。
+        #id等于none时会认为正在启动一个全新的实验运行
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    #当处于分布式环境时，实例化DistributedSampler会将数据集切分成若干份，确保每个gpu只读取它自己那一部分数据
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    #梯度缩放器，在用fp16计算时，可能会出现梯度下溢现象，GradScaler会将loss乘一个很大的数，从而放大梯度，在优化器更新权重之前，再把放大的梯度恢复到原本的大小
+    #当dtype=float16时启动
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
@@ -147,6 +155,7 @@ if __name__ == "__main__":
     
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
+        #这行代码会对模型进行编译，生成一个优化过的版本，优化过程包括算子融合、生成更高效的底层代码，让模型跑的更快
         model = torch.compile(model)
         Logger('torch.compile enabled')
     if dist.is_initialized():
@@ -154,10 +163,17 @@ if __name__ == "__main__":
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
+        #set_epoch是在每个epoch重新设置数据集的采样顺序，会根据epoch的索引，重新设置随机数种子
+        #使每个epoch产生不同的随机顺序，从而确保每个epoch用不同的样本顺序进行训练
         train_sampler and train_sampler.set_epoch(epoch)
+        #代码中的分号；是python中的语法特性，可以用来在同一行中执行多个语句
+        #torch.randperm是在生成一个随机打乱后的数据索引列表，会生成从0到len(train_ds)的随机排列，然后再转为list
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        #dataset负责给它一个idx，返回一条数据，Sampler负责决定按上面顺序给dataset提供idx，所以sampler本质上就是一个索引生成器
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        #这里传的是batch_sampler，dataloader不再自己决定batch怎么组成，而是听sampler的
+        #根据sampler提供的索引来取数据
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')

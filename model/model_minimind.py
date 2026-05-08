@@ -54,43 +54,76 @@ class RMSNorm(torch.nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def norm(self, x):
+        #rsqrt是sqrt的倒数，keepdim是保持维度不变，这里是把求平均的维度位置为1
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        #self.weight是一个可学习的参数
         return (self.weight * self.norm(x.float())).type_as(x)
 
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
+
+    """
+    把原本只能支持较短上下文的RoPE，平滑地扩展到更长上下文
+    普通rope的频率是f，位置m的旋转角度是mf，如果上下文长度很长，m很大，角度会转的太快，模型泛化不好
+    YaRN的做法是对一部分频率进行缩放，让他们转的慢一点
+    一部分频率保持原样，保留短上下文能力
+    一部分频率平滑过渡
+    一部分频率缩小，用于支持长上下文
+    """
     if rope_scaling is not None: # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
+        """
+        orig_max是原模型训练时支持的最大位置长度
+        factor是上下文扩展倍数
+        beta_fast和beat_slow用来决定哪些维度的频率保持不变
+        attn_factir是乘在cos/sin上的attention的缩放因子
+        """
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
             rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
         )
+        #只有当你实际预计算的长度end超过原始最大长度时，才需要做rope scaling
         if end / orig_max > 1.0:
+            #inv_dim推理公式，用beta，也就是这里的b控制周期和原始上下文长度之间的关系
             inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+            #low，high是两个分界点
+            #0到low的区间，ramp=0，频率不变，low到high的区间，ramp从0平滑加到1，high到dim//2的区间，ramp=1，频率除以factor
             low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+            #torch.clamp是裁剪或限制张量中元素的数值范围，torch.clamp(input,min,max),不满足范围内的用最大最小值代替
             ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
             freqs = freqs * (1 - ramp + ramp / factor)
     t = torch.arange(end, device=freqs.device)
+    #[end,dim//2]
     freqs = torch.outer(t, freqs).float()
+    #[end,dim]
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
     return freqs_cos, freqs_sin
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+
+    # rope作用在qk上，传统的正弦位置编码一般加在token embedding上，不用作用在v上，因为注意力分数计算只用qk
+    #常见的qk shape是[baych,num_heads,seq_len,head_dim]要对头和seq_len做一个维度交换以适应硬件要求
+    #...表示省略前面所有的维度，前面的维度都按原样保留
     def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
     q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    用于GQA和MQA attention 把k/v heads复制成和query_heads一样多，方便后面做attention计算
+    """
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1: return x
+    #None是在这里插入一个新维度，expand通常不真的复制维度，只是创建一个广播视图，所以更省内存
     return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
 class Attention(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
+        #qk用几个头
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
         self.n_local_heads = config.num_attention_heads
         self.n_local_kv_heads = self.num_key_value_heads
@@ -106,6 +139,7 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
+        #self.flash是布尔值
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
@@ -121,15 +155,25 @@ class Attention(nn.Module):
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
+        #这段是在判断，当前情况能不能走Pytorch中内置的高效attention实现，scaled_dot_product_attention
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
         if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
+            #@是矩阵乘法，*是逐元素相乘，两个张量形状必须相同
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            #torch.full是生成一个形状指定，且所有元素都填充为同一个固定值的张量
+            #triu是pytorch中用于提取矩阵上三角的函数，diagonal参数=0时，保留主对角线及以上的元素，>0时保留主对角线上方的第N条对角线及以上的元素，<0时保留主对角线下方及以下的元素,其余用0替代
+            #triu只对张量的后两个维度进行操作
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            #casual mask和attention_mask管的是两件事
+            #casual_mask是阻止当前位置看到未来token，attention_mask是告诉模型哪些是有效的，哪些token不应该看见
+            #attention_mask是在padding时忽略padding部分的注意力分数
             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            #对注意力分数做一个正则化
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        #还要对输出结果做一个正则化
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
@@ -155,20 +199,34 @@ class MOEFeedForward(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, hidden_dim = x.shape
+        #[bs*seq_len,hidden_dim]
         x_flat = x.view(-1, hidden_dim)
+        #[bs*seq_len,num_experts]
         scores = F.softmax(self.gate(x_flat), dim=-1)
+        #[bs*seq_len,num_experts_per_tok]
         topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
         if self.config.norm_topk_prob: topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        #[bs*seq_len,hidden_dim]
         y = torch.zeros_like(x_flat)
         for i, expert in enumerate(self.experts):
-            mask = (topk_idx == i)
+            #[bs*seq_len,num_experts_per_tok]
+            mask = (topk_idx == i)  
+            #any()用来判断是否至少有一个元素为真
             if mask.any():
+                #nonzero用来返回非零元素的索引，flatten将结果展成一维向量
+                #[num_selected_tokens] 
                 token_idx = mask.any(dim=-1).nonzero().flatten()
+                #[num_selected_tokens,1]，这里mask是一个和top_weight同维度的布尔矩阵，会把top_weight中和mask矩阵位置相同且为True的部分提取出来
                 weight = topk_weight[mask].view(-1, 1)
+                #x_flat[token_idx]->[num_selected_tokens,hidden_dim]
+                #y[token_idx] += expert_output，index_add_(dim,index,source)
                 y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
             elif self.training:
+                #某个专家没参与计算，也把它挂到计算图上
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.config.router_aux_loss_coef > 0:
+            #F.one_hot(topk_idx, self.config.num_experts)->[bs*seq_len,num_experts_per_tok,num_experts]，会把原来的每一个数字变成一组one-hot向量
+            #做mean(0)后，会在第一个维度做平均，[num_experts_per_tok,num_experts]
             load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
             self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
         else:
@@ -202,6 +260,7 @@ class MiniMindModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        #[max_position_embeddings,head_dim]
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
@@ -228,6 +287,7 @@ class MiniMindModel(nn.Module):
             )
             presents.append(present)
         hidden_states = self.norm(hidden_states)
+        #sum方法中第二个参数为初始值，new_zeros创建与当前张量同类型，同设备的新零张量。里面的参数是形状，设置一个初值0
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
@@ -239,7 +299,9 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        #nn.Embedding的权重矩阵存储是(input_dim,output_dim),nn.Linear的权重矩阵存储是转秩过后的
         if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
+        #在模型所有子模块创建完成后，执行Huggingface规定的后处理初始化逻辑
         self.post_init()
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
@@ -250,11 +312,14 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         if labels is not None:
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+        #把loss，aux_loss，logits等封装成一个标准输出对象，方便训练，推理,以后可以用字典的方式访问
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
     
     # https://github.com/jingyaogong/minimind/discussions/611
+    #表示这个函数在推理模式下运行，不计算梯度
     @torch.inference_mode()
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
+        #这里的repeat是向量复制，这里是在第0维复制num_return_sequences次，第1维复制1次，也就是不变
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         past_key_values = kwargs.pop("past_key_values", None)
@@ -265,17 +330,21 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             logits = outputs.logits[:, -1, :] / temperature
+            #重复惩罚，如果某个token已经在当前生成序列里出现过，就降低它下一次再次被选中的概率
             if repetition_penalty != 1.0:
+                #torch.unique是去重，给张量
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]; logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
             if top_k > 0: 
                 logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
+            #按概率从高到低，只保留累计概率达到top_P之前的token
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
                 mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
                 logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
-            next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
+            next_token = torch.multinomial(torch.softmax(logits, dim=-1),num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
+            #torch.where是pytorch的条件选择函数，类似三元运算符torch.where(condition,x,y)
             if eos_token_id is not None: next_token = torch.where(finished.unsqueeze(-1), next_token.new_full((next_token.shape[0], 1), eos_token_id), next_token)
             input_ids = torch.cat([input_ids, next_token], dim=-1)
             past_key_values = outputs.past_key_values if use_cache else None

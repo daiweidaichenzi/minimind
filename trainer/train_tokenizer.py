@@ -44,6 +44,7 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         vocab_size=vocab_size,
         show_progress=True,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        #BpeTrainer会优先给special_token分配id，而且一般是按special_tokens列表顺序分配
         special_tokens=all_special_tokens
     )
     texts = get_texts(data_path)
@@ -68,10 +69,15 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         idx = tokenizer.token_to_id(token)
         added_tokens_decoder[str(idx)] = {
             "content": token,
+            #lstrip表示匹配这个token时，是否把它左边的空白字符一起吃掉
             "lstrip": False,
+            #表示这个token按原始字符串精确匹配，不被normalizer改动
             "normalized": False,
+            #是否把右边的字符吃掉
             "rstrip": False,
+            #这个token是否只能作为一个完整单词匹配
             "single_word": False,
+            #被tokenizer的special token逻辑特殊处理
             "special": True if token in special_tokens_list else False
         }
 

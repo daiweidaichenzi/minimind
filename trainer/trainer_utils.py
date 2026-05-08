@@ -17,6 +17,7 @@ from model.model_minimind import MiniMindForCausalLM
 
 def get_model_params(model, config):
     total = sum(p.numel() for p in model.parameters()) / 1e6
+    #getattr用于动态获取对象的属性或方法
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
     n_active = getattr(config, 'num_experts_per_tok', 0)
     n_shared = getattr(config, 'n_shared_experts', 0)
@@ -52,13 +53,13 @@ def init_distributed_mode():
 
 
 def setup_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    random.seed(seed)#设置python的随机种子
+    np.random.seed(seed)#设置numpy的随机种子
+    torch.manual_seed(seed)#设置cpu随机种子
+    torch.cuda.manual_seed(seed)#设置pytorch在当前GPU上的随机种子
+    torch.cuda.manual_seed_all(seed)#设置pytorch在所有GPU上的随机种子
+    torch.backends.cudnn.deterministic = True#使用确定性算法
+    torch.backends.cudnn.benchmark = False#禁用cudnn的自动优化
 
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
     os.makedirs(save_dir, exist_ok=True)
@@ -66,13 +67,16 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
     resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
 
-    if model is not None:
+    if model is not None:#存储模型模式
+        #如果模型被DDP包了，真正的模型在model.module里
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
         raw_model = getattr(raw_model, '_orig_mod', raw_model)
         state_dict = raw_model.state_dict()
+        #half表示转成float16，然后移到cpu上
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
         ckp_tmp = ckp_path + '.tmp'
         torch.save(state_dict, ckp_tmp)
+        #os.replace用于将一个文件替换成另一个文件 os.replace(src, dst) 将 src 文件替换为 dst 文件，如果 dst 已经存在，则会被替换掉。这是一个原子操作，确保在替换过程中不会出现文件损坏或丢失的情况。
         os.replace(ckp_tmp, ckp_path)
         wandb_id = None
         if wandb:
@@ -87,6 +91,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
             'step': step,
+            #训练时用了几张GPU
             'world_size': dist.get_world_size() if dist.is_initialized() else 1,
             'wandb_id': wandb_id
         }
@@ -102,10 +107,12 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         resume_tmp = resume_path + '.tmp'
         torch.save(resume_data, resume_tmp)
         os.replace(resume_tmp, resume_path)
+        #删除临时变量，然后清理cuda缓存
         del state_dict, resume_data
         torch.cuda.empty_cache()
     else:  # 加载模式
         if os.path.exists(resume_path):
+            #加载到gpu
             ckp_data = torch.load(resume_path, map_location='cpu')
             saved_ws = ckp_data.get('world_size', 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1

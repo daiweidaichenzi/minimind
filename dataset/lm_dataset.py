@@ -39,6 +39,7 @@ class PretrainDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        #load_dataset是HuggingFace datasets库上用来加载数据集的函数，可以加载HuggingFace Hub上的数据，也可以加载本地的json/csv/txt等文件
         self.samples = load_dataset('json', data_files=data_path, split='train')
 
     def __len__(self):
