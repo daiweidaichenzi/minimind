@@ -22,6 +22,8 @@ def get_texts(data_path):
                 continue
 
 def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPECIAL_TOKENS_NUM):
+    #tokenizer处理文本过程
+    #原始文本->normalizer->pre_tokenizer->model->post_processor
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     
@@ -48,6 +50,7 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         special_tokens=all_special_tokens
     )
     texts = get_texts(data_path)
+   
     tokenizer.train_from_iterator(texts, trainer=trainer)
     tokenizer.decoder = decoders.ByteLevel()
     tokenizer.add_special_tokens(special_tokens_list)
