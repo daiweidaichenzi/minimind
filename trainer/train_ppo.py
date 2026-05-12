@@ -19,8 +19,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model_minimind_mla import MiniMindMLAConfig, MiniMindMLAForCausalLM
 from dataset.lm_dataset import RLAIFDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel
+from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel, get_model_suffix
 from trainer.rollout_engine import create_rollout_engine
 
 warnings.filterwarnings('ignore')
@@ -32,20 +33,21 @@ def rep_penalty(text, n=3, cap=0.5):
     return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
 
 
-# 自定义的Critic模型，继承自MiniMindLM
-class CriticModel(MiniMindForCausalLM):
-    def __init__(self, params):
-        super().__init__(params)
-        # 替换lm_head为输出单一价值的线性层
-        self.value_head = nn.Linear(params.hidden_size, 1)
+def _make_critic_model(base_class):
+    class CriticModel(base_class):
+        def __init__(self, params):
+            super().__init__(params)
+            # 替换lm_head为输出单一价值的线性层
+            self.value_head = nn.Linear(params.hidden_size, 1)
 
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
-        # 使用基础模型获取隐藏状态
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-        hidden_states = self.model.norm(outputs[0])
-        # 使用value_head获取价值估计
-        values = self.value_head(hidden_states).squeeze(-1)
-        return values
+        def forward(self, input_ids=None, attention_mask=None, **kwargs):
+            # 使用基础模型获取隐藏状态
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+            hidden_states = self.model.norm(outputs[0])
+            # 使用value_head获取价值估计
+            values = self.value_head(hidden_states).squeeze(-1)
+            return values
+    return CriticModel
 
 
 def calculate_rewards(prompts, responses, reward_model):
@@ -272,8 +274,8 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             actor_model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            model_suffix = get_model_suffix(lm_config)
+            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{model_suffix}.pth'
             raw_actor = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
             raw_actor = getattr(raw_actor, '_orig_mod', raw_actor)
             actor_state = raw_actor.state_dict()
@@ -310,6 +312,8 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--use_mla', default=0, type=int, choices=[0, 1], help="是否使用MLA注意力架构（0=否，1=是）")
+    parser.add_argument('--kv_lora_rank', default=128, type=int, help="MLA的KV压缩秩（仅use_mla=1时生效）")
     parser.add_argument('--max_seq_len', default=768, type=int, help="Prompt最大长度")
     parser.add_argument("--max_gen_len", type=int, default=1024, help="生成的最大长度")
     parser.add_argument("--data_path", type=str, default="../dataset/rlaif.jsonl", help="RLAIF数据路径")
@@ -344,7 +348,7 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    lm_config = MiniMindMLAConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe), kv_lora_rank=args.kv_lora_rank) if args.use_mla else MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -367,9 +371,10 @@ if __name__ == "__main__":
     actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
     ref_model, _ = init_model(lm_config, base_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
-    moe_suffix = '_moe' if lm_config.use_moe else ''
-    ckp = f'{args.save_dir}/{base_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+    model_suffix = get_model_suffix(lm_config)
+    ckp = f'{args.save_dir}/{base_weight}_{lm_config.hidden_size}{model_suffix}.pth'
     state_dict = torch.load(ckp, map_location=args.device)
+    CriticModel = _make_critic_model(MiniMindMLAForCausalLM if isinstance(lm_config, MiniMindMLAConfig) else MiniMindForCausalLM)
     critic_model = CriticModel(lm_config)
     critic_model.load_state_dict(state_dict, strict=False)
     critic_model = critic_model.to(args.device)

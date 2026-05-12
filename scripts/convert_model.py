@@ -9,14 +9,20 @@ import transformers
 import warnings
 from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig, Qwen3MoeForCausalLM
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model_minimind_mla import MiniMindMLAConfig, MiniMindMLAForCausalLM
 from model.model_lora import apply_lora, merge_lora
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
 def convert_torch2transformers_minimind(torch_path, transformers_path, dtype=torch.float16):
-    MiniMindConfig.register_for_auto_class()
-    MiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")
-    lm_model = MiniMindForCausalLM(lm_config)
+    if isinstance(lm_config, MiniMindMLAConfig):
+        MiniMindMLAConfig.register_for_auto_class()
+        MiniMindMLAForCausalLM.register_for_auto_class("AutoModelForCausalLM")
+        lm_model = MiniMindMLAForCausalLM(lm_config)
+    else:
+        MiniMindConfig.register_for_auto_class()
+        MiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")
+        lm_model = MiniMindForCausalLM(lm_config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     state_dict = torch.load(torch_path, map_location=device)
     lm_model.load_state_dict(state_dict, strict=False)
@@ -104,7 +110,10 @@ def convert_transformers2torch(transformers_path, torch_path):
 
 def convert_merge_base_lora(base_torch_path, lora_path, merged_torch_path):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    lm_model = MiniMindForCausalLM(lm_config).to(device)
+    if isinstance(lm_config, MiniMindMLAConfig):
+        lm_model = MiniMindMLAForCausalLM(lm_config).to(device)
+    else:
+        lm_model = MiniMindForCausalLM(lm_config).to(device)
     state_dict = torch.load(base_torch_path, map_location=device)
     lm_model.load_state_dict(state_dict, strict=False)
     apply_lora(lm_model)
@@ -126,17 +135,33 @@ def convert_json_to_jinja(json_file_path, output_path):
 
 
 if __name__ == '__main__':
-    lm_config = MiniMindConfig(hidden_size=768, num_hidden_layers=8, max_seq_len=8192, use_moe=False)
+    import argparse
+    parser = argparse.ArgumentParser(description="MiniMind Model Conversion")
+    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
+    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
+    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--use_mla', default=0, type=int, choices=[0, 1], help="是否使用MLA注意力架构（0=否，1=是）")
+    parser.add_argument('--kv_lora_rank', default=128, type=int, help="MLA的KV压缩秩（仅use_mla=1时生效）")
+    parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀")
+    parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
+    args = parser.parse_args()
+
+    if args.use_mla:
+        lm_config = MiniMindMLAConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, max_seq_len=8192, use_moe=bool(args.use_moe), kv_lora_rank=args.kv_lora_rank)
+    else:
+        lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, max_seq_len=8192, use_moe=bool(args.use_moe))
+    model_suffix = '_moe' if lm_config.use_moe else ''
+    if isinstance(lm_config, MiniMindMLAConfig): model_suffix += '_mla'
 
     # convert torch to transformers
-    torch_path = f"../out/full_sft_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
+    torch_path = f"../{args.save_dir}/{args.weight}_{lm_config.hidden_size}{model_suffix}.pth"
     transformers_path = '../minimind-3'
     convert_torch2transformers(torch_path, transformers_path)
 
     # # merge lora
-    # base_torch_path = f"../out/full_sft_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
-    # lora_path = f"../out/lora_identity_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
-    # merged_torch_path = f"../out/merge_identity_{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}.pth"
+    # base_torch_path = f"../{args.save_dir}/{args.weight}_{lm_config.hidden_size}{model_suffix}.pth"
+    # lora_path = f"../{args.save_dir}/lora_identity_{lm_config.hidden_size}{model_suffix}.pth"
+    # merged_torch_path = f"../{args.save_dir}/merge_identity_{lm_config.hidden_size}{model_suffix}.pth"
     # convert_merge_base_lora(base_torch_path, lora_path, merged_torch_path)
 
     # convert_transformers2torch(transformers_path, torch_path)

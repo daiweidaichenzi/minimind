@@ -5,6 +5,7 @@ import warnings
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model_minimind_mla import MiniMindMLAConfig, MiniMindMLAForCausalLM
 from model.model_lora import *
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
@@ -12,14 +13,25 @@ warnings.filterwarnings('ignore')
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if 'model' in args.load_from:
-        model = MiniMindForCausalLM(MiniMindConfig(
-            hidden_size=args.hidden_size,
-            num_hidden_layers=args.num_hidden_layers,
-            use_moe=bool(args.use_moe),
-            inference_rope_scaling=args.inference_rope_scaling
-        ))
-        moe_suffix = '_moe' if args.use_moe else ''
-        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
+        if args.use_mla:
+            config = MiniMindMLAConfig(
+                hidden_size=args.hidden_size,
+                num_hidden_layers=args.num_hidden_layers,
+                use_moe=bool(args.use_moe),
+                inference_rope_scaling=args.inference_rope_scaling,
+                kv_lora_rank=args.kv_lora_rank
+            )
+            model = MiniMindMLAForCausalLM(config)
+        else:
+            model = MiniMindForCausalLM(MiniMindConfig(
+                hidden_size=args.hidden_size,
+                num_hidden_layers=args.num_hidden_layers,
+                use_moe=bool(args.use_moe),
+                inference_rope_scaling=args.inference_rope_scaling
+            ))
+        model_suffix = '_moe' if args.use_moe else ''
+        if args.use_mla: model_suffix += '_mla'
+        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{model_suffix}.pth'
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
         if args.lora_weight != 'None':
             apply_lora(model)
@@ -38,6 +50,8 @@ def main():
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--use_mla', default=0, type=int, choices=[0, 1], help="是否使用MLA注意力架构（0=否，1=是）")
+    parser.add_argument('--kv_lora_rank', default=128, type=int, help="MLA的KV压缩秩（仅use_mla=1时生效）")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
     parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
@@ -62,8 +76,10 @@ def main():
     conversation = []
     model, tokenizer = init_model(args)
     input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
+    #TextStreamer是transformers里的文本流式输出器，在model.generate生成过程中，边生成边把文本输出到终端
+    #tokenizer用来把tokne转成文本，skip_prompt=True不把输入提示词也打印出来，skip_special_tokens=True不打印特殊token
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-    
+    #iter是python自带的迭代器，将一个函数包装成可迭代对象，第一个参数是一个函数，第二个参数是结束值，当input的输入值为''时结束迭代
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
     for prompt in prompt_iter:
         setup_seed(random.randint(0, 31415926))
@@ -71,10 +87,11 @@ def main():
         conversation = conversation[-args.historys:] if args.historys else []
         conversation.append({"role": "user", "content": prompt})
         if 'pretrain' in args.weight:
+            print(tokenizer.bos_token)
             inputs = tokenizer.bos_token + prompt
         else:
             inputs = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True, open_thinking=bool(args.open_thinking))
-        
+        #return_tensors=‘pt'是返回pytorch张量
         inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
 
         print('🧠: ', end='')

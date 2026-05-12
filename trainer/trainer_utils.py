@@ -14,6 +14,15 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from model.model_minimind import MiniMindForCausalLM
+from model.model_minimind_mla import MiniMindMLAConfig, MiniMindMLAForCausalLM
+
+def get_model_suffix(lm_config):
+    """根据模型配置返回 checkpoint 文件名后缀"""
+    suffix = ''
+    if getattr(lm_config, 'use_moe', False): suffix += '_moe'
+    if isinstance(lm_config, MiniMindMLAConfig): suffix += '_mla'
+    return suffix
+
 
 def get_model_params(model, config):
     total = sum(p.numel() for p in model.parameters()) / 1e6
@@ -63,7 +72,7 @@ def setup_seed(seed: int):
 
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
     os.makedirs(save_dir, exist_ok=True)
-    moe_path = '_moe' if lm_config.use_moe else ''
+    moe_path = get_model_suffix(lm_config)
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
     resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
 
@@ -125,11 +134,14 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniMindForCausalLM(lm_config)
+    if isinstance(lm_config, MiniMindMLAConfig):
+        model = MiniMindMLAForCausalLM(lm_config)
+    else:
+        model = MiniMindForCausalLM(lm_config)
 
     if from_weight!= 'none':
-        moe_suffix = '_moe' if lm_config.use_moe else ''
-        weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+        model_suffix = get_model_suffix(lm_config)
+        weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{model_suffix}.pth'
         weights = torch.load(weight_path, map_location=device)
         model.load_state_dict(weights, strict=False)
 
