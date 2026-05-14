@@ -81,9 +81,9 @@ class SFTDataset(Dataset):
         tools = None
         for message in conversations:
             message = dict(message)
-            # 如果消息是system角色，且带了tools字段
+            #如果消息是system角色，且带了tools字段
             if message.get("role") == "system" and message.get("tools"):
-                # json.loads把json格式字符串解析为python对象
+                #json.loads把json格式字符串解析为python对象
                 tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
             if message.get("tool_calls") and isinstance(message["tool_calls"], str):
                 message["tool_calls"] = json.loads(message["tool_calls"])
