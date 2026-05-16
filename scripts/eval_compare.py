@@ -65,7 +65,17 @@ def compute_ppl(model, tokenizer, data_path, device, max_samples=200, max_length
         item = json.loads(line)
         # SFT 格式：有 conversations 字段
         if "conversations" in item:
-            text = tokenizer.apply_chat_template(item["conversations"], tokenize=False, add_generation_prompt=False)
+            # 和 SFTDataset.create_chat_prompt 逻辑一致：提取 tools、解析 tool_calls
+            tools = None
+            messages = []
+            for msg in item["conversations"]:
+                msg = dict(msg)
+                if msg.get("role") == "system" and msg.get("tools"):
+                    tools = json.loads(msg["tools"]) if isinstance(msg["tools"], str) else msg["tools"]
+                if msg.get("tool_calls") and isinstance(msg["tool_calls"], str):
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                messages.append(msg)
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, tools=tools)
         else:
             text = item.get("text", "")
         if not text.strip():
